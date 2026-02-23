@@ -19,11 +19,23 @@ useGLTF.preload("/finalbaseballcard.glb");
 useTexture.preload("/band.jpg");
 
 export default function App() {
+  // ✅ Critical for Vercel + iframe: ensure the canvas actually has a real height
+  useEffect(() => {
+    const style = document.createElement("style");
+    style.innerHTML = `
+      html, body, #root { height: 100%; width: 100%; margin: 0; overflow: hidden; }
+      canvas { display: block; }
+    `;
+    document.head.appendChild(style);
+    return () => document.head.removeChild(style);
+  }, []);
+
   return (
     <div style={{ width: "100vw", height: "100vh", touchAction: "none" }}>
       <Canvas
-        style={{ width: "100%", height: "100%", touchAction: "none" }} // IMPORTANT for iframe + touch
+        dpr={[1, 2]}
         camera={{ position: [0, 0.3, 13], fov: 25 }}
+        gl={{ antialias: true, alpha: false }}
       >
         <color attach="background" args={["#597d70"]} />
 
@@ -32,6 +44,7 @@ export default function App() {
         <directionalLight position={[-6, 5, -6]} intensity={0.7} />
         <Environment preset="city" />
 
+        {/* ✅ Keep fixed timestep + interpolate (production stability) */}
         <Physics gravity={[0, -40, 0]} timeStep={1 / 60} interpolate>
           <BandAndCard />
         </Physics>
@@ -40,10 +53,7 @@ export default function App() {
   );
 }
 
-/**
- * Small components so Rapier joint hooks are NOT called in a loop in the same component.
- * (Hook rules stay clean + stable.)
- */
+/** Keep joint hooks out of loops */
 function RopeLink({ a, b, length }) {
   useRopeJoint(a, b, [[0, 0, 0], [0, 0, 0], length]);
   return null;
@@ -54,12 +64,9 @@ function SphericalLink({ a, b, anchorA, anchorB }) {
 }
 
 function BandAndCard({
-  // Rope tuning
-  segmentLength = 0.7,
+  segmentLength = 0.75,
   segments = 7,
-  rigY = 6.2,
 
-  // Smoothing
   maxSpeed = 45,
   minSpeed = 12,
 }) {
@@ -68,9 +75,6 @@ function BandAndCard({
   const fixed = useRef();
   const joints = useRef([]);
   const card = useRef();
-
-  // layout anchor (pure layout, NOT inside the GLB)
-  const layoutAnchor = useRef();
 
   // rigid strap stub at clip
   const strapStub = useRef();
@@ -96,7 +100,6 @@ function BandAndCard({
   const dir = useMemo(() => new THREE.Vector3(), []);
   const ang = useMemo(() => new THREE.Vector3(), []);
   const rot = useMemo(() => new THREE.Vector3(), []);
-  const hookWorld = useMemo(() => new THREE.Vector3(), []);
   const tmpA = useMemo(() => new THREE.Vector3(), []);
   const tmpB = useMemo(() => new THREE.Vector3(), []);
   const up = useMemo(() => new THREE.Vector3(0, 1, 0), []);
@@ -112,6 +115,10 @@ function BandAndCard({
   // ---- responsive positioning ----
   const RIGHT_MARGIN = 2.2;
   const rigX = viewport.width / 2 - RIGHT_MARGIN;
+
+  // ✅ Critical: hook stays inside visible top region (works in iframe + Vercel)
+  const TOP_MARGIN = 0.8; // world units
+  const rigY =6.5;
 
   // ---- curve for meshline ----
   const [curve] = useState(
@@ -130,13 +137,11 @@ function BandAndCard({
     angularDamping: 5,
     linearDamping: 5,
   };
-
   const nearHookProps = {
     ...segmentProps,
     angularDamping: 14,
     linearDamping: 10,
   };
-
   const nearCardProps = {
     ...segmentProps,
     angularDamping: 10,
@@ -156,26 +161,21 @@ function BandAndCard({
   }, [hovered, dragged]);
 
   /**
-   * RESET (layout-driven)
-   * IMPORTANT FIX: guard against 0/very small size during initial iframe/prod layout.
+   * ✅ RESET ONLY ON RESIZE / VIEWPORT CHANGE
+   * (No per-frame anchor “gluing” — that’s what was causing production weirdness.)
    */
   useEffect(() => {
     if (!fixed.current || !card.current) return;
     if (!joints.current?.length) return;
 
-    // IMPORTANT: prevents the “falls off” / wrong spawn during first production layout tick
-    if (width < 10 || height < 10) return;
-
     const ax = rigX;
     const ay = rigY;
     const az = 0;
 
-    // fixed
     fixed.current.setTranslation({ x: ax, y: ay, z: az }, true);
     fixed.current.setLinvel({ x: 0, y: 0, z: 0 }, true);
     fixed.current.setAngvel({ x: 0, y: 0, z: 0 }, true);
 
-    // joints
     joints.current.forEach((ref, i) => {
       const j = ref.current;
       if (!j) return;
@@ -186,7 +186,6 @@ function BandAndCard({
       j.lerped = undefined;
     });
 
-    // card
     card.current.setTranslation(
       { x: ax, y: ay - (segments + 1) * segmentLength - 0.4, z: az },
       true
@@ -199,31 +198,11 @@ function BandAndCard({
     card.current.wakeUp();
   }, [width, height, rigX, rigY, segments, segmentLength]);
 
-  // Pointer helpers (DOM element capture — required for iframes)
-  const capturePointer = (e) => {
-    const el = e?.nativeEvent?.target;
-    if (el?.setPointerCapture) el.setPointerCapture(e.pointerId);
-  };
-  const releasePointer = (e) => {
-    const el = e?.nativeEvent?.target;
-    if (el?.releasePointerCapture) el.releasePointerCapture(e.pointerId);
-  };
+  useFrame((state, deltaRaw) => {
+    // ✅ Clamp delta (production tabs / iframe can spike delta → physics goes crazy)
+    const delta = Math.min(deltaRaw, 1 / 30);
 
-  useFrame((state, delta) => {
-    // 1) GLUE PHYSICS ANCHOR TO *LAYOUT* ANCHOR
-    if (layoutAnchor.current && fixed.current) {
-      layoutAnchor.current.getWorldPosition(hookWorld);
-
-      fixed.current.setTranslation(
-        { x: hookWorld.x, y: hookWorld.y, z: hookWorld.z },
-        true
-      );
-      fixed.current.setLinvel({ x: 0, y: 0, z: 0 }, true);
-      fixed.current.setAngvel({ x: 0, y: 0, z: 0 }, true);
-      fixed.current.wakeUp();
-    }
-
-    // 2) Dragging
+    // Dragging
     if (dragged) {
       vec.set(state.pointer.x, state.pointer.y, 0.5).unproject(state.camera);
       dir.copy(vec).sub(state.camera.position).normalize();
@@ -238,7 +217,7 @@ function BandAndCard({
       });
     }
 
-    // 3) Smooth joints + update strap curve
+    // Smooth joints + update strap curve
     if (fixed.current && card.current && band.current) {
       joints.current.forEach((ref, idx) => {
         if (!ref.current) return;
@@ -282,7 +261,6 @@ function BandAndCard({
       else dir.copy(up);
 
       const STUB_LEN = 0.22;
-
       const start = vec.copy(tmpA).addScaledVector(dir, STUB_LEN);
       curve.points[0].copy(start);
 
@@ -302,15 +280,15 @@ function BandAndCard({
       underHook.copy(first.translation()).lerp(top, 0.5);
 
       curve.points[segments + 1].copy(top);
-
       band.current.geometry.setPoints(curve.getPoints(90));
 
+      // reduce weird spinning
       ang.copy(card.current.angvel());
       rot.copy(card.current.rotation());
       card.current.setAngvel({ x: ang.x, y: ang.y - rot.y * 0.25, z: ang.z });
     }
 
-    // 4) Flip animation
+    // Flip animation
     if (modelGroup.current) {
       modelGroup.current.rotation.y = THREE.MathUtils.lerp(
         modelGroup.current.rotation.y,
@@ -320,16 +298,13 @@ function BandAndCard({
     }
   });
 
-  // initial positions
+  // initial positions (prevents one-frame pop)
   const initialAx = rigX;
   const initialAy = rigY;
   const initialAz = 0;
 
   return (
     <>
-      {/* PURE LAYOUT ANCHOR (drives physics anchor) */}
-      <group ref={layoutAnchor} position={[rigX, rigY, 0]} />
-
       {/* Fixed hook/anchor (physics) */}
       <RigidBody
         ref={fixed}
@@ -360,11 +335,12 @@ function BandAndCard({
         const b = joints.current[i];
         return <RopeLink key={`rope-${i}`} a={a} b={b} length={segmentLength} />;
       })}
+
       <SphericalLink
         a={joints.current[segments - 1]}
         b={card}
         anchorA={[0, 0, 0]}
-        anchorB={[0, 1.85, 0]}
+        anchorB={[0, 2.65, 0]}
       />
 
       {/* Badge rigid body */}
@@ -382,68 +358,56 @@ function BandAndCard({
       >
         <CuboidCollider args={[0.8, 1.125, 0.06]} />
 
-        {/* IMPORTANT FIX:
-            Use an invisible "hitbox" mesh for pointer events (reliable in iframe).
-            The visible GLB stays unchanged underneath.
-        */}
-        <group scale={2.25} position={[0, -0.9, 0]}>
-          {/* Invisible hitbox for grabbing + clicking */}
-          <mesh
-            position={[0, 0.2, 0.05]}
-            onPointerOver={() => hover(true)}
-            onPointerOut={() => hover(false)}
-            onPointerDown={(e) => {
-              e.stopPropagation();
-              capturePointer(e);
+        {/* Visible model */}
+        <group
+          scale={2.25}
+          position={[0, -0.2, 0]}
+          onPointerOver={() => hover(true)}
+          onPointerOut={() => hover(false)}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            e.target.setPointerCapture(e.pointerId);
 
-              pointerDown.current = true;
-              dragStarted.current = false;
-              downXY.current = [e.clientX, e.clientY];
+            pointerDown.current = true;
+            dragStarted.current = false;
+            downXY.current = [e.clientX, e.clientY];
 
-              dragOffset.current
-                .copy(e.point)
-                .sub(vec.copy(card.current.translation()));
-            }}
-            onPointerMove={(e) => {
-              if (!pointerDown.current) return;
+            dragOffset.current.copy(e.point).sub(vec.copy(card.current.translation()));
+          }}
+          onPointerMove={(e) => {
+            if (!pointerDown.current) return;
 
-              const [sx, sy] = downXY.current;
-              const dx = e.clientX - sx;
-              const dy = e.clientY - sy;
+            const [sx, sy] = downXY.current;
+            const dx = e.clientX - sx;
+            const dy = e.clientY - sy;
 
-              if (!dragStarted.current && Math.hypot(dx, dy) > CLICK_DRAG_THRESHOLD) {
-                dragStarted.current = true;
-                drag(dragOffset.current.clone());
-              }
-            }}
-            onPointerUp={(e) => {
-              e.stopPropagation();
-              releasePointer(e);
+            if (!dragStarted.current && Math.hypot(dx, dy) > CLICK_DRAG_THRESHOLD) {
+              dragStarted.current = true;
+              drag(dragOffset.current.clone());
+            }
+          }}
+          onPointerUp={(e) => {
+            e.stopPropagation();
+            e.target.releasePointerCapture(e.pointerId);
 
-              if (!dragStarted.current) {
-                const next = !flipped;
-                setFlipped(next);
-                targetRotY.current = next ? Math.PI : 0;
-              }
+            if (!dragStarted.current) {
+              const next = !flipped;
+              setFlipped(next);
+              targetRotY.current = next ? Math.PI : 0;
+            }
 
-              pointerDown.current = false;
-              dragStarted.current = false;
-              drag(false);
-            }}
-          >
-            {/* Sized so: after scale(2.25), it becomes ~ (1.62 x 2.25) which matches your collider */}
-            <planeGeometry args={[0.72, 1.0]} />
-            <meshBasicMaterial transparent opacity={0} />
-          </mesh>
-
-          {/* Visible model */}
+            pointerDown.current = false;
+            dragStarted.current = false;
+            drag(false);
+          }}
+        >
           <group ref={modelGroup}>
             <primitive object={scene} />
           </group>
         </group>
       </RigidBody>
 
-      {/* Rigid rectangle strap stub right at the clip */}
+      {/* Strap stub */}
       <mesh ref={strapStub} geometry={strapStubGeo} renderOrder={10}>
         <meshStandardMaterial map={texture} transparent side={THREE.DoubleSide} />
       </mesh>
