@@ -20,8 +20,11 @@ useTexture.preload("/band.jpg");
 
 export default function App() {
   return (
-    <div style={{ width: "100vw", height: "100vh" }}>
-      <Canvas camera={{ position: [0, 0.3, 13], fov: 25 }}>
+    <div style={{ width: "100vw", height: "100vh", touchAction: "none" }}>
+      <Canvas
+        style={{ width: "100%", height: "100%", touchAction: "none" }} // IMPORTANT for iframe + touch
+        camera={{ position: [0, 0.3, 13], fov: 25 }}
+      >
         <color attach="background" args={["#597d70"]} />
 
         <ambientLight intensity={0.9} />
@@ -107,8 +110,6 @@ function BandAndCard({
   texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
 
   // ---- responsive positioning ----
-  // Keep a constant margin from the RIGHT edge in WORLD units.
-  // Bigger RIGHT_MARGIN => move left.
   const RIGHT_MARGIN = 2.2;
   const rigX = viewport.width / 2 - RIGHT_MARGIN;
 
@@ -156,11 +157,14 @@ function BandAndCard({
 
   /**
    * RESET (layout-driven)
-   * IMPORTANT: This uses ONLY rigX/rigY (responsive layout), NOT any HookAnchor in the GLB.
+   * IMPORTANT FIX: guard against 0/very small size during initial iframe/prod layout.
    */
   useEffect(() => {
     if (!fixed.current || !card.current) return;
     if (!joints.current?.length) return;
+
+    // IMPORTANT: prevents the “falls off” / wrong spawn during first production layout tick
+    if (width < 10 || height < 10) return;
 
     const ax = rigX;
     const ay = rigY;
@@ -195,8 +199,18 @@ function BandAndCard({
     card.current.wakeUp();
   }, [width, height, rigX, rigY, segments, segmentLength]);
 
+  // Pointer helpers (DOM element capture — required for iframes)
+  const capturePointer = (e) => {
+    const el = e?.nativeEvent?.target;
+    if (el?.setPointerCapture) el.setPointerCapture(e.pointerId);
+  };
+  const releasePointer = (e) => {
+    const el = e?.nativeEvent?.target;
+    if (el?.releasePointerCapture) el.releasePointerCapture(e.pointerId);
+  };
+
   useFrame((state, delta) => {
-    // 1) GLUE PHYSICS ANCHOR TO *LAYOUT* ANCHOR (stable across fullscreen/window/mobile)
+    // 1) GLUE PHYSICS ANCHOR TO *LAYOUT* ANCHOR
     if (layoutAnchor.current && fixed.current) {
       layoutAnchor.current.getWorldPosition(hookWorld);
 
@@ -226,7 +240,6 @@ function BandAndCard({
 
     // 3) Smooth joints + update strap curve
     if (fixed.current && card.current && band.current) {
-      // lerp middle joints
       joints.current.forEach((ref, idx) => {
         if (!ref.current) return;
 
@@ -245,7 +258,6 @@ function BandAndCard({
         );
       });
 
-      // smooth fixed
       if (!fixed.current.lerped) {
         fixed.current.lerped = new THREE.Vector3().copy(fixed.current.translation());
       }
@@ -259,49 +271,40 @@ function BandAndCard({
       const last = joints.current[segments - 1].current;
       if (!first || !last) return;
 
-      // --- bottom attach near card ---
-      tmpA.copy(last.translation()); // attach point
+      tmpA.copy(last.translation());
 
-      // next joint up to get direction
       const aboveRB = joints.current[segments - 2]?.current;
       if (aboveRB) tmpB.copy(aboveRB.translation());
       else tmpB.copy(tmpA).addScaledVector(up, 0.001);
 
-      // direction clip -> above
       dir.copy(tmpB).sub(tmpA);
       if (dir.lengthSq() > 1e-6) dir.normalize();
       else dir.copy(up);
 
       const STUB_LEN = 0.22;
 
-      // MeshLine starts slightly above clip
       const start = vec.copy(tmpA).addScaledVector(dir, STUB_LEN);
       curve.points[0].copy(start);
 
-      // rigid rectangle stub aligned to rope direction
       if (strapStub.current) {
         strapStub.current.position.copy(tmpA).addScaledVector(dir, STUB_LEN * 0.5);
         q.setFromUnitVectors(up, dir);
         strapStub.current.quaternion.copy(q);
       }
 
-      // interior points up the rope
       for (let i = 1; i <= segments - 1; i++) {
         const j = joints.current[segments - 1 - i]?.current;
         if (!j) break;
         curve.points[i].copy(j.lerped ?? j.translation());
       }
 
-      // control tangent under hook
       const underHook = curve.points[segments];
       underHook.copy(first.translation()).lerp(top, 0.5);
 
-      // final point = hook
       curve.points[segments + 1].copy(top);
 
       band.current.geometry.setPoints(curve.getPoints(90));
 
-      // reduce weird spinning
       ang.copy(card.current.angvel());
       rot.copy(card.current.rotation());
       card.current.setAngvel({ x: ang.x, y: ang.y - rot.y * 0.25, z: ang.z });
@@ -317,7 +320,7 @@ function BandAndCard({
     }
   });
 
-  // initial positions (so you don't see one-frame pop at 0,0,0)
+  // initial positions
   const initialAx = rigX;
   const initialAy = rigY;
   const initialAz = 0;
@@ -344,14 +347,14 @@ function BandAndCard({
           {...(i <= 1
             ? nearHookProps
             : i >= segments - 2
-              ? nearCardProps
-              : segmentProps)}
+            ? nearCardProps
+            : segmentProps)}
         >
           <BallCollider args={[0.08]} />
         </RigidBody>
       ))}
 
-      {/* Joints (hooks in child components) */}
+      {/* Joints */}
       {joints.current.map((ref, i) => {
         const a = i === 0 ? fixed : joints.current[i - 1];
         const b = joints.current[i];
@@ -379,49 +382,61 @@ function BandAndCard({
       >
         <CuboidCollider args={[0.8, 1.125, 0.06]} />
 
-        {/* Visible model (drag + click flip) */}
-        <group
-          scale={2.25}
-          position={[0, -0.9, 0]}
-          onPointerOver={() => hover(true)}
-          onPointerOut={() => hover(false)}
-          onPointerDown={(e) => {
-            e.stopPropagation();
-            e.target.setPointerCapture(e.pointerId);
+        {/* IMPORTANT FIX:
+            Use an invisible "hitbox" mesh for pointer events (reliable in iframe).
+            The visible GLB stays unchanged underneath.
+        */}
+        <group scale={2.25} position={[0, -0.9, 0]}>
+          {/* Invisible hitbox for grabbing + clicking */}
+          <mesh
+            position={[0, 0.2, 0.05]}
+            onPointerOver={() => hover(true)}
+            onPointerOut={() => hover(false)}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              capturePointer(e);
 
-            pointerDown.current = true;
-            dragStarted.current = false;
-            downXY.current = [e.clientX, e.clientY];
+              pointerDown.current = true;
+              dragStarted.current = false;
+              downXY.current = [e.clientX, e.clientY];
 
-            dragOffset.current.copy(e.point).sub(vec.copy(card.current.translation()));
-          }}
-          onPointerMove={(e) => {
-            if (!pointerDown.current) return;
+              dragOffset.current
+                .copy(e.point)
+                .sub(vec.copy(card.current.translation()));
+            }}
+            onPointerMove={(e) => {
+              if (!pointerDown.current) return;
 
-            const [sx, sy] = downXY.current;
-            const dx = e.clientX - sx;
-            const dy = e.clientY - sy;
+              const [sx, sy] = downXY.current;
+              const dx = e.clientX - sx;
+              const dy = e.clientY - sy;
 
-            if (!dragStarted.current && Math.hypot(dx, dy) > CLICK_DRAG_THRESHOLD) {
-              dragStarted.current = true;
-              drag(dragOffset.current.clone());
-            }
-          }}
-          onPointerUp={(e) => {
-            e.stopPropagation();
-            e.target.releasePointerCapture(e.pointerId);
+              if (!dragStarted.current && Math.hypot(dx, dy) > CLICK_DRAG_THRESHOLD) {
+                dragStarted.current = true;
+                drag(dragOffset.current.clone());
+              }
+            }}
+            onPointerUp={(e) => {
+              e.stopPropagation();
+              releasePointer(e);
 
-            if (!dragStarted.current) {
-              const next = !flipped;
-              setFlipped(next);
-              targetRotY.current = next ? Math.PI : 0;
-            }
+              if (!dragStarted.current) {
+                const next = !flipped;
+                setFlipped(next);
+                targetRotY.current = next ? Math.PI : 0;
+              }
 
-            pointerDown.current = false;
-            dragStarted.current = false;
-            drag(false);
-          }}
-        >
+              pointerDown.current = false;
+              dragStarted.current = false;
+              drag(false);
+            }}
+          >
+            {/* Sized so: after scale(2.25), it becomes ~ (1.62 x 2.25) which matches your collider */}
+            <planeGeometry args={[0.72, 1.0]} />
+            <meshBasicMaterial transparent opacity={0} />
+          </mesh>
+
+          {/* Visible model */}
           <group ref={modelGroup}>
             <primitive object={scene} />
           </group>
